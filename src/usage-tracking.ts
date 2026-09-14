@@ -49,7 +49,7 @@ export function loadKiroUsageTracking(agentDir = getPiAgentDir()): KiroUsageTrac
   if (legacyEnabled && !warnedLegacyEnabled) {
     warnedLegacyEnabled = true;
     console.warn(
-      '[pi-provider-kiro] usageTracking.enabled is deprecated; use usageTracking.estimateDollarValue instead.',
+      "[pi-provider-kiro] usageTracking.enabled is deprecated; use usageTracking.estimateDollarValue instead.",
     );
   }
 

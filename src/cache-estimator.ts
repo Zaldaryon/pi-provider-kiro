@@ -51,8 +51,7 @@ export function applyCacheEstimate(
     return 0;
   }
 
-  const expired =
-    config.estimatedCacheTimeout > 0 && now - previous.turnTimestamp > config.estimatedCacheTimeout;
+  const expired = config.estimatedCacheTimeout > 0 && now - previous.turnTimestamp > config.estimatedCacheTimeout;
   const contextShrank = usage.input < previous.promptTokens * 0.6;
   if (expired || contextShrank) {
     noteSuccessfulTurn(conversationId, promptTokens, usage.input, now);
