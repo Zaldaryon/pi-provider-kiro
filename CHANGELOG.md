@@ -7,24 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-15
+
 ### Added
 
-- Add opt-in Kiro cache-usage estimation for Pi token dashboards. `usageTracking.estimateCacheUsage` conservatively reclassifies prompt tokens repeated from the previous successful turn in the same session as cache reads, marks the usage with `cacheEstimated`, resets after configurable idle expiry or large context reduction, and always defers to real wire cache counters. `estimatedCacheTimeout` defaults to five minutes and accepts `0` to disable expiry.
-- Rename opt-in credit conversion to `usageTracking.estimateDollarValue`; legacy `usageTracking.enabled` remains accepted with a deprecation warning. The estimate converts the final successful attempt's exact credit count to an estimated USD-equivalent total, using the published `$0.04` add-on-credit rate by default or an optional `usdPerCredit` override. Tracking remains disabled by default; the estimate is not an invoice, and subscription-included credits may have no marginal cost.
-
-### Fixed
-
-- Resolve `ksk_` API key profiles through GetProfile instead of ListAvailableProfiles, which returns 403 Unsupported token type. Catalog queries then use that ARN in us-east-1. `KIRO_PROFILE_ARN` still wins.
-
-- Preserve canonical `developer` messages emitted by newer Pi-compatible hosts by lowering them to Kiro user input. Agent reminders and advisories previously degraded to the neutral `"Please proceed with the task."` placeholder when current, and disappeared from historical context entirely.
-
-- Report a turn that silently produced less than the model sent. `streamKiro` now sets `AssistantMessage.errorMessage` when the empty-response or echo-loop retry budget is exhausted, and when a tool call is dropped because its arguments would not parse — the last of which is unrecoverable downstream, since the call is gone before the message is persisted. Dropped-call tool names use a terminal-safe A–P encoding in the diagnostic: complete sets that fit preserve every JavaScript UTF-16 code unit, while oversized sets become one fixed-size SHA-256 fingerprint rather than a misleading partial identity. Thus a model-chosen name such as `set_timeout` or `http500_probe` cannot make a terminal failure match a consumer's retry filter and disappear again. No `stopReason` changes: the value stays inside pi-ai's existing union, and the exhaustion warning now reports the reason actually assigned instead of promising `"stop"`. The diagnostics are deliberately worded as terminal so a consumer's retryable-error classifier cannot mistake them for a transient transport failure. Note the consequence for hosts that fail a run on any non-retryable trailing `errorMessage` without checking `stopReason`: a silent turn that previously completed quietly now surfaces as a failure. That is the point of the change, but it is a visible behaviour change, not only added observability. Hosts that cannot be reached by this field are unaffected: pi-ai's `isRetryableAssistantError` requires `stopReason === "error"`, and of `isContextOverflow`'s three branches only the first reads `errorMessage` behind that same gate — its silent-overflow and length-stop branches judge `usage` alone.
+- Opt-in Kiro usage estimates for Pi dashboards ([#157](https://github.com/mikeyobrien/pi-provider-kiro/pull/157)). `usageTracking.estimateDollarValue` converts the final successful attempt's credit count to an estimated USD-equivalent total, using the published `$0.04` add-on-credit rate by default or an optional `usdPerCredit` override. `usageTracking.estimateCacheUsage` conservatively reclassifies prompt tokens repeated from the previous successful turn in the same session as cache reads, marks the usage with `cacheEstimated`, resets after configurable idle expiry or large context reduction, and always defers to real wire cache counters. `estimatedCacheTimeout` defaults to five minutes and accepts `0` to disable expiry. Legacy `usageTracking.enabled` remains accepted as a deprecated alias for `estimateDollarValue`. Both estimators are disabled by default and fail closed on invalid settings. These are estimates, not invoices: subscription-included credits may have no marginal cost, and estimated cache usage does not prove a backend cache hit.
+- Typed `KiroApiError` with `status`, `reasonCode`, `retryAfterMs`, and `providerAttempts`, exported from the entry point ([#111](https://github.com/mikeyobrien/pi-provider-kiro/pull/111)). Runtime failures no longer throw a flat `Error` whose classification had to be recovered from prose.
+- Scan local Kiro credentials at startup (and when the host `refreshModels` hook has no credential) so catalog discovery can run without the host passing credentials: `KIRO_API_KEY`, then kiro-cli social, then kiro-cli, then Kiro IDE ([#147](https://github.com/mikeyobrien/pi-provider-kiro/pull/147)). The factory stays synchronous; discovery is fire-and-forget after `registerProvider`.
 
 ### Changed
 
-- Write the catalog cache to ~/.pi/agent/kiro-management-models-cache.json, still reading the legacy ~/.kiro-management-models-cache.json path.
+- Write the catalog cache to `~/.pi/agent/kiro-management-models-cache.json`, still reading the legacy `~/.kiro-management-models-cache.json` path ([#149](https://github.com/mikeyobrien/pi-provider-kiro/pull/149)).
 
-- At startup (and when the host refreshModels hook has no credential), scan KIRO_API_KEY then kiro-cli then Kiro IDE and refresh the catalog without blocking registration.
+### Fixed
+
+- Resolve `ksk_` API key profiles through GetProfile instead of ListAvailableProfiles, which returns 403 Unsupported token type. Catalog queries then use that ARN in us-east-1. `KIRO_PROFILE_ARN` still wins ([#147](https://github.com/mikeyobrien/pi-provider-kiro/pull/147)).
+- Preserve canonical `developer` messages emitted by newer Pi-compatible hosts by lowering them to Kiro user input. Agent reminders and advisories previously degraded to the neutral `"Please proceed with the task."` placeholder when current, and disappeared from historical context entirely ([#151](https://github.com/mikeyobrien/pi-provider-kiro/pull/151)).
+- Cancel the response body read when the caller abort signal fires mid-stream, so Esc/interrupt no longer waits for the server to finish generating ([#153](https://github.com/mikeyobrien/pi-provider-kiro/pull/153)).
+- Map IAM Identity Center region `ap-northeast-2` to Kiro API region `us-east-1`, so Korean-region SSO credentials can reach management and runtime endpoints ([#133](https://github.com/mikeyobrien/pi-provider-kiro/pull/133)).
+- Route Kiro stream events by the modeled `:event-type` key instead of field sniffing ([#113](https://github.com/mikeyobrien/pi-provider-kiro/pull/113)). `metadataEvent` token usage is no longer dropped, `meteringEvent` credit counts are no longer misread as tokens, and exception-framed errors keep their modeled class. Cache read/write counters, split metadata frames, and wire `totalTokens` are recorded; usage is scoped to one retry attempt so a discarded attempt cannot bill the turn that replaced it.
+- Report a turn that silently produced less than the model sent ([#119](https://github.com/mikeyobrien/pi-provider-kiro/pull/119)). `streamKiro` now sets `AssistantMessage.errorMessage` when the empty-response or echo-loop retry budget is exhausted, and when a tool call is dropped because its arguments would not parse — the last of which is unrecoverable downstream, since the call is gone before the message is persisted. Dropped-call tool names use a terminal-safe A–P encoding in the diagnostic: complete sets that fit preserve every JavaScript UTF-16 code unit, while oversized sets become one fixed-size SHA-256 fingerprint rather than a misleading partial identity. Thus a model-chosen name such as `set_timeout` or `http500_probe` cannot make a terminal failure match a consumer's retry filter and disappear again. No `stopReason` changes: the value stays inside pi-ai's existing union, and the exhaustion warning now reports the reason actually assigned instead of promising `"stop"`. The diagnostics are deliberately worded as terminal so a consumer's retryable-error classifier cannot mistake them for a transient transport failure. Note the consequence for hosts that fail a run on any non-retryable trailing `errorMessage` without checking `stopReason`: a silent turn that previously completed quietly now surfaces as a failure. That is the point of the change, but it is a visible behaviour change, not only added observability. Hosts that cannot be reached by this field are unaffected: pi-ai's `isRetryableAssistantError` requires `stopReason === "error"`, and of `isContextOverflow`'s three branches only the first reads `errorMessage` behind that same gate — its silent-overflow and length-stop branches judge `usage` alone.
 
 ## [0.10.2] - 2026-08-31
 
@@ -262,7 +264,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial release: 17 models across 7 families, OAuth device code flow, kiro-cli SQLite credential fallback, streaming pipeline with thinking tag parser
 
-[Unreleased]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.10.2...HEAD
+[Unreleased]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.9.3...v0.10.0
