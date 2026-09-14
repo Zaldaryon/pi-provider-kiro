@@ -22,6 +22,7 @@ import * as PiAi from "@earendil-works/pi-ai";
 import { UniversalEventStreamMarshaller } from "@smithy/core/event-streams";
 import type { Message } from "@smithy/types";
 import { parseBracketToolCalls } from "./bracket-tool-parser.js";
+import { applyCacheEstimate } from "./cache-estimator.js";
 import { debugEnabled, debugLog, formatSafeError, redactSensitiveText } from "./debug.js";
 import {
   buildKiroAdditionalModelRequestFields,
@@ -86,6 +87,7 @@ import {
   truncate,
 } from "./transform.js";
 import { TRUNCATION_NOTICE, wasPreviousResponseTruncated } from "./truncation.js";
+import { estimateKiroCreditCost, type KiroUsageTracking } from "./usage-tracking.js";
 
 const CAPACITY_LOG_DIR = join(homedir(), ".pi", "logs");
 const CAPACITY_LOG_FILE = join(CAPACITY_LOG_DIR, "capacity-retries.log");
@@ -389,6 +391,31 @@ function emitToolCall(
 }
 
 export function streamKiro(
+  model: Model<Api>,
+  context: Context,
+  options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+  return streamKiroWithUsageTracking(
+    {
+      estimateDollarValue: false,
+      usdPerCredit: 0,
+      estimateCacheUsage: false,
+      estimatedCacheTimeout: 300_000,
+    },
+    model,
+    context,
+    options,
+  );
+}
+
+export function createKiroStream(
+  usageTracking: KiroUsageTracking,
+): (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream {
+  return (model, context, options) => streamKiroWithUsageTracking(usageTracking, model, context, options);
+}
+
+function streamKiroWithUsageTracking(
+  usageTracking: KiroUsageTracking,
   model: Model<Api>,
   context: Context,
   options?: SimpleStreamOptions,
@@ -1023,6 +1050,7 @@ export function streamKiro(
         let totalContent = "";
         let lastContentData = "";
         let usageEvent: KiroUsageData | null = null;
+        let meteringEvent: { credits?: number; unit?: string } | null = null;
         let receivedContextUsage = false;
         const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
         let nativeThinkingBlockIndex: number | null = null;
@@ -1278,8 +1306,7 @@ export function streamKiro(
               break;
             }
             case "metering": {
-              // MeteringEvent.usage counts credits, not tokens. Recorded for
-              // observability only; never folded into token accounting.
+              meteringEvent = event.data;
               if (debugEnabled()) debugLog("stream.metering", [event.data]);
               break;
             }
@@ -1581,6 +1608,25 @@ export function streamKiro(
           // requires `!sawAnyToolCalls`. Kept so that loosening either predicate
           // appends rather than silently overwriting an exhaustion diagnostic.
           output.errorMessage = output.errorMessage ? `${output.errorMessage}. ${dropDiagnostic}` : dropDiagnostic;
+        }
+        if (!output.errorMessage) {
+          const estimatedRead = applyCacheEstimate(
+            conversationId,
+            output.usage,
+            usageEvent,
+            usageTracking,
+            output.timestamp,
+          );
+          if (estimatedRead > 0) {
+            debugLog("usage.estimate", {
+              conversationId,
+              estimatedRead,
+              input: output.usage.input,
+              cacheRead: output.usage.cacheRead,
+            });
+          }
+          const estimatedCost = estimateKiroCreditCost(usageTracking, meteringEvent);
+          if (estimatedCost !== undefined) output.usage.cost.total = estimatedCost;
         }
         stream.push({ type: "done", reason: output.stopReason as "stop" | "toolUse", message: output });
         debugLog("response.done", {

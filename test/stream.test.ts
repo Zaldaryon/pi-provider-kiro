@@ -11,10 +11,12 @@ import type {
 import { isContextOverflow, isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { findJsonEnd } from "../src/bracket-tool-parser.js";
+import { resetCacheEstimatorForTests } from "../src/cache-estimator.js";
 import { validateKiroConversation, validateKiroToolStructure } from "../src/history-validator.js";
 import { capacityRetryConfig, retryConfig } from "../src/retry.js";
-import { resetProfileArnCache, streamKiro } from "../src/stream.js";
+import { createKiroStream, resetProfileArnCache, streamKiro } from "../src/stream.js";
 import { EMPTY_CONTENT_PLACEHOLDER, type KiroHistoryEntry } from "../src/transform.js";
+import type { KiroUsageTracking } from "../src/usage-tracking.js";
 import {
   concatMessages,
   encodeEventMessage,
@@ -223,6 +225,14 @@ function mockFetchChunked(chunks: string[]) {
 }
 
 describe("Feature 9: Streaming Integration", () => {
+  const trackedStream = (usdPerCredit = 0.04) =>
+    createKiroStream({
+      estimateDollarValue: true,
+      usdPerCredit,
+      estimateCacheUsage: false,
+      estimatedCacheTimeout: 300_000,
+    } satisfies KiroUsageTracking);
+
   beforeEach(() => {
     // Mark profileArn as already resolved so tests don't see an extra fetch
     resetProfileArnCache(true);
@@ -3756,6 +3766,50 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
+  it("estimates repeated Kiro input as cache reads across one session", async () => {
+    resetCacheEstimatorForTests();
+    const estimateConfig: KiroUsageTracking = {
+      estimateDollarValue: false,
+      usdPerCredit: 0.04,
+      estimateCacheUsage: true,
+      estimatedCacheTimeout: 300_000,
+    };
+    const estimatedStream = createKiroStream(estimateConfig);
+
+    vi.stubGlobal(
+      "fetch",
+      mockFetchChunked([
+        '{"content":"First"}',
+        '{"tokenUsage":{"uncachedInputTokens":500,"outputTokens":200,"totalTokens":700}}',
+      ]),
+    );
+    const firstEvents = await collect(
+      estimatedStream(makeModel(), makeContext(), { apiKey: "tok", sessionId: "cache-estimate-session" }),
+    );
+    const first = firstEvents.find((event) => event.type === "done");
+    expect(first?.type === "done" && first.message.usage.cacheRead).toBe(0);
+
+    vi.stubGlobal(
+      "fetch",
+      mockFetchChunked([
+        '{"content":"Second"}',
+        '{"tokenUsage":{"uncachedInputTokens":900,"outputTokens":100,"totalTokens":1000}}',
+      ]),
+    );
+    const secondEvents = await collect(
+      estimatedStream(makeModel(), makeContext(), { apiKey: "tok", sessionId: "cache-estimate-session" }),
+    );
+    const second = secondEvents.find((event) => event.type === "done");
+    expect(second).toBeDefined();
+    if (second?.type !== "done") throw new Error("Expected a completed assistant message");
+    expect(second.message.usage.input).toBe(200);
+    expect(second.message.usage.cacheRead).toBe(700);
+    expect(second.message.usage.totalTokens).toBe(1000);
+    expect((second.message.usage as unknown as Record<string, unknown>).cacheEstimated).toBe(true);
+
+    vi.unstubAllGlobals();
+  });
+
   it("records cacheRead/cacheWrite so a cached turn is not priced as uncached input", async () => {
     // TokenUsage.uncachedInputTokens excludes cache reads. Taking `input` from
     // it while leaving cacheRead at 0 would report ~200 input tokens for a turn
@@ -3806,6 +3860,149 @@ describe("Feature 9: Streaming Integration", () => {
     expect(msg.usage.totalTokens).toBe(50250);
 
     vi.unstubAllGlobals();
+  });
+
+  it("converts valid metering credits to estimated USD-equivalent cost when enabled", async () => {
+    const frames = concatMessages(
+      encodeEventMessage({ content: "Hello" }),
+      encodeEventMessage({ usage: 3, unit: "credit", unitPlural: "credits" }, "meteringEvent"),
+    );
+    const mockFetch = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({ done: false, value: frames })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          releaseLock: () => {},
+        }),
+        cancel: async () => {},
+      },
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(trackedStream()(makeModel(), makeContext(), { apiKey: "tok" }));
+    const done = events.find((event) => event.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+
+    expect(msg?.usage.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.12 });
+  });
+
+  it("uses a custom USD-per-credit rate", async () => {
+    const frames = concatMessages(
+      encodeEventMessage({ content: "Hello" }),
+      encodeEventMessage({ usage: 2, unit: "credits" }, "meteringEvent"),
+    );
+    const mockFetch = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({ done: false, value: frames })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          releaseLock: () => {},
+        }),
+        cancel: async () => {},
+      },
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(trackedStream(0.025)(makeModel(), makeContext(), { apiKey: "tok" }));
+    const done = events.find((event) => event.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+
+    expect(msg?.usage.cost.total).toBe(0.05);
+  });
+
+  it.each([
+    ["missing unit", { usage: 3 }],
+    ["wrong unit", { usage: 3, unit: "token" }],
+    ["negative credits", { usage: -1, unit: "credit" }],
+    ["non-finite credits", { usage: null, unit: "credit" }],
+  ])("does not convert %s", async (_label, metering) => {
+    const frames = concatMessages(
+      encodeEventMessage({ content: "Hello" }),
+      encodeEventMessage(metering, "meteringEvent"),
+    );
+    const mockFetch = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({ done: false, value: frames })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          releaseLock: () => {},
+        }),
+        cancel: async () => {},
+      },
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(trackedStream()(makeModel(), makeContext(), { apiKey: "tok" }));
+    const done = events.find((event) => event.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+
+    expect(msg?.usage.cost.total).toBe(0);
+  });
+
+  it("converts zero credits to zero cost", async () => {
+    const frames = concatMessages(
+      encodeEventMessage({ content: "Hello" }),
+      encodeEventMessage({ usage: 0, unit: "CREDIT" }, "meteringEvent"),
+    );
+    const mockFetch = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({ done: false, value: frames })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          releaseLock: () => {},
+        }),
+        cancel: async () => {},
+      },
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(trackedStream()(makeModel(), makeContext(), { apiKey: "tok" }));
+    const done = events.find((event) => event.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+
+    expect(msg?.usage.cost.total).toBe(0);
+  });
+
+  it("does not carry metering from a discarded retry attempt", async () => {
+    const first = concatMessages(encodeEventMessage({ usage: 9, unit: "credit" }, "meteringEvent"));
+    const second = concatMessages(
+      encodeEventMessage({ content: "Hello" }),
+      encodeEventMessage({ usage: 2, unit: "credit" }, "meteringEvent"),
+    );
+    const response = (frames: Uint8Array) => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({ done: false, value: frames })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          releaseLock: () => {},
+        }),
+        cancel: async () => {},
+      },
+    });
+    const mockFetch = vi.fn().mockResolvedValueOnce(response(first)).mockResolvedValueOnce(response(second));
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(trackedStream()(makeModel(), makeContext(), { apiKey: "tok" }));
+    const done = events.find((event) => event.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+
+    expect(msg?.usage.cost.total).toBe(0.08);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 
   it("keeps metadataEvent token counts when a meteringEvent credit frame follows", async () => {
