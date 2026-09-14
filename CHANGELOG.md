@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep version dots in generated display names for catalog models missing from the bootstrap list. The name was derived from the pi ID, where `toPiModelId` had already rewritten `5.1` as `5-1`, so `claude-fable-5.1` rendered as "Claude Fable 5 1"; it now reads "Claude Fable 5.1".
+
 ## [0.11.0] - 2026-09-15
 
 ### Added
