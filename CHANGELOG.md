@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add opt-in Kiro credit usage tracking for Pi cost dashboards. `usageTracking.enabled` converts the final successful attempt's exact credit count to an estimated USD-equivalent total, using the published `$0.04` add-on-credit rate by default or an optional `usdPerCredit` override. Tracking remains disabled by default; the estimate is not an invoice, and subscription-included credits may have no marginal cost.
+- Add opt-in Kiro cache-usage estimation for Pi token dashboards. `usageTracking.estimateCacheUsage` conservatively reclassifies prompt tokens repeated from the previous successful turn in the same session as cache reads, marks the usage with `cacheEstimated`, resets after configurable idle expiry or large context reduction, and always defers to real wire cache counters. `estimatedCacheTimeout` defaults to five minutes and accepts `0` to disable expiry.
+- Rename opt-in credit conversion to `usageTracking.estimateDollarValue`; legacy `usageTracking.enabled` remains accepted with a deprecation warning. The estimate converts the final successful attempt's exact credit count to an estimated USD-equivalent total, using the published `$0.04` add-on-credit rate by default or an optional `usdPerCredit` override. Tracking remains disabled by default; the estimate is not an invoice, and subscription-included credits may have no marginal cost.
 
 ### Fixed
 

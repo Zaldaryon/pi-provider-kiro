@@ -11,6 +11,7 @@ import type {
 import { isContextOverflow, isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { findJsonEnd } from "../src/bracket-tool-parser.js";
+import { resetCacheEstimatorForTests } from "../src/cache-estimator.js";
 import { validateKiroConversation, validateKiroToolStructure } from "../src/history-validator.js";
 import { capacityRetryConfig, retryConfig } from "../src/retry.js";
 import { createKiroStream, resetProfileArnCache, streamKiro } from "../src/stream.js";
@@ -225,7 +226,12 @@ function mockFetchChunked(chunks: string[]) {
 
 describe("Feature 9: Streaming Integration", () => {
   const trackedStream = (usdPerCredit = 0.04) =>
-    createKiroStream({ enabled: true, usdPerCredit } satisfies KiroUsageTracking);
+    createKiroStream({
+      estimateDollarValue: true,
+      usdPerCredit,
+      estimateCacheUsage: false,
+      estimatedCacheTimeout: 300_000,
+    } satisfies KiroUsageTracking);
 
   beforeEach(() => {
     // Mark profileArn as already resolved so tests don't see an extra fetch
@@ -3756,6 +3762,50 @@ describe("Feature 9: Streaming Integration", () => {
     // contextPercent should still reflect the API's contextUsagePercentage,
     // not be derived from the (overwritten) input token count
     expect((msg.usage as unknown as Record<string, unknown>).contextPercent).toBe(10);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("estimates repeated Kiro input as cache reads across one session", async () => {
+    resetCacheEstimatorForTests();
+    const estimateConfig: KiroUsageTracking = {
+      estimateDollarValue: false,
+      usdPerCredit: 0.04,
+      estimateCacheUsage: true,
+      estimatedCacheTimeout: 300_000,
+    };
+    const estimatedStream = createKiroStream(estimateConfig);
+
+    vi.stubGlobal(
+      "fetch",
+      mockFetchChunked([
+        '{"content":"First"}',
+        '{"tokenUsage":{"uncachedInputTokens":500,"outputTokens":200,"totalTokens":700}}',
+      ]),
+    );
+    const firstEvents = await collect(
+      estimatedStream(makeModel(), makeContext(), { apiKey: "tok", sessionId: "cache-estimate-session" }),
+    );
+    const first = firstEvents.find((event) => event.type === "done");
+    expect(first?.type === "done" && first.message.usage.cacheRead).toBe(0);
+
+    vi.stubGlobal(
+      "fetch",
+      mockFetchChunked([
+        '{"content":"Second"}',
+        '{"tokenUsage":{"uncachedInputTokens":900,"outputTokens":100,"totalTokens":1000}}',
+      ]),
+    );
+    const secondEvents = await collect(
+      estimatedStream(makeModel(), makeContext(), { apiKey: "tok", sessionId: "cache-estimate-session" }),
+    );
+    const second = secondEvents.find((event) => event.type === "done");
+    expect(second).toBeDefined();
+    if (second?.type !== "done") throw new Error("Expected a completed assistant message");
+    expect(second.message.usage.input).toBe(200);
+    expect(second.message.usage.cacheRead).toBe(700);
+    expect(second.message.usage.totalTokens).toBe(1000);
+    expect((second.message.usage as unknown as Record<string, unknown>).cacheEstimated).toBe(true);
 
     vi.unstubAllGlobals();
   });

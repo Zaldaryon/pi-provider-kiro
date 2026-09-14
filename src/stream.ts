@@ -22,6 +22,7 @@ import * as PiAi from "@earendil-works/pi-ai";
 import { UniversalEventStreamMarshaller } from "@smithy/core/event-streams";
 import type { Message } from "@smithy/types";
 import { parseBracketToolCalls } from "./bracket-tool-parser.js";
+import { applyCacheEstimate } from "./cache-estimator.js";
 import { debugEnabled, debugLog, formatSafeError, redactSensitiveText } from "./debug.js";
 import {
   buildKiroAdditionalModelRequestFields,
@@ -394,7 +395,17 @@ export function streamKiro(
   context: Context,
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
-  return streamKiroWithUsageTracking({ enabled: false }, model, context, options);
+  return streamKiroWithUsageTracking(
+    {
+      estimateDollarValue: false,
+      usdPerCredit: 0,
+      estimateCacheUsage: false,
+      estimatedCacheTimeout: 300_000,
+    },
+    model,
+    context,
+    options,
+  );
 }
 
 export function createKiroStream(
@@ -1599,6 +1610,21 @@ function streamKiroWithUsageTracking(
           output.errorMessage = output.errorMessage ? `${output.errorMessage}. ${dropDiagnostic}` : dropDiagnostic;
         }
         if (!output.errorMessage) {
+          const estimatedRead = applyCacheEstimate(
+            conversationId,
+            output.usage,
+            usageEvent,
+            usageTracking,
+            output.timestamp,
+          );
+          if (estimatedRead > 0) {
+            debugLog("usage.estimate", {
+              conversationId,
+              estimatedRead,
+              input: output.usage.input,
+              cacheRead: output.usage.cacheRead,
+            });
+          }
           const estimatedCost = estimateKiroCreditCost(usageTracking, meteringEvent);
           if (estimatedCost !== undefined) output.usage.cost.total = estimatedCost;
         }

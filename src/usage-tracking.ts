@@ -1,5 +1,5 @@
-// ABOUTME: Opt-in usage tracking config — reads pi settings for Kiro credit accounting.
-// ABOUTME: Converts MeteringEvent credits into an estimated USD-equivalent cost.
+// ABOUTME: Opt-in usage tracking config for Kiro dollar-value and cache-usage estimates.
+// ABOUTME: Converts metering credits to USD and configures conservative cache-read estimation.
 
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -11,36 +11,84 @@ import { join } from "node:path";
  */
 export const DEFAULT_USD_PER_CREDIT = 0.04;
 
-/** Resolved conversion policy. `enabled: false` reproduces the historical zero-cost behaviour. */
-export type KiroUsageTracking = { enabled: false } | { enabled: true; usdPerCredit: number };
+/** Match Pi's prompt-cache TTL and Anthropic's default cache lifetime. */
+export const DEFAULT_ESTIMATED_CACHE_TIMEOUT_MS = 5 * 60 * 1000;
 
-const DISABLED: KiroUsageTracking = Object.freeze({ enabled: false });
+/** Resolved estimation policy. Both estimates are independently opt-in. */
+export interface KiroUsageTracking {
+  estimateDollarValue: boolean;
+  usdPerCredit: number;
+  estimateCacheUsage: boolean;
+  estimatedCacheTimeout: number;
+}
+
+const DISABLED: KiroUsageTracking = Object.freeze({
+  estimateDollarValue: false,
+  usdPerCredit: DEFAULT_USD_PER_CREDIT,
+  estimateCacheUsage: false,
+  estimatedCacheTimeout: DEFAULT_ESTIMATED_CACHE_TIMEOUT_MS,
+});
 
 /** `MeteringEvent.unit` values that denote credits. The service has emitted both. */
 const CREDIT_UNITS = new Set(["credit", "credits"]);
+let warnedLegacyEnabled = false;
 
 /**
- * Load the conversion policy from pi's settings file.
+ * Load estimation policy from pi's settings file.
  *
- * Fails closed on every unreadable, malformed, or out-of-range input: usage
- * accounting is opt-in, so an unparseable setting must leave cost reporting
- * exactly as it was rather than guess a rate. Settings contents are never
- * logged — the file holds credentials for other providers.
+ * Each estimate fails closed independently on malformed input. Settings contents
+ * are never logged because the file may contain credentials for other providers.
  */
 export function loadKiroUsageTracking(agentDir = getPiAgentDir()): KiroUsageTracking {
   const raw = readSettings(join(agentDir, "settings.json"));
   const tracking = asRecord(asRecord(raw)?.["pi-provider-kiro"])?.usageTracking;
   const section = asRecord(tracking);
-  if (!section || section.enabled !== true) return DISABLED;
+  if (!section) return { ...DISABLED };
 
-  const usdPerCredit = resolveRate(section.usdPerCredit);
-  if (usdPerCredit === undefined) {
+  const legacyEnabled = section.enabled === true;
+  if (legacyEnabled && !warnedLegacyEnabled) {
+    warnedLegacyEnabled = true;
     console.warn(
-      "[pi-provider-kiro] Ignoring usageTracking: usdPerCredit must be a finite number >= 0. Usage tracking stays disabled.",
+      '[pi-provider-kiro] usageTracking.enabled is deprecated; use usageTracking.estimateDollarValue instead.',
     );
-    return DISABLED;
   }
-  return { enabled: true, usdPerCredit };
+
+  const estimateDollarValue = section.estimateDollarValue === true || legacyEnabled;
+  const estimateCacheUsage = section.estimateCacheUsage === true;
+  let usdPerCredit = DEFAULT_USD_PER_CREDIT;
+  let estimatedCacheTimeout = DEFAULT_ESTIMATED_CACHE_TIMEOUT_MS;
+
+  if (estimateDollarValue) {
+    const rate = resolveNonNegativeNumber(section.usdPerCredit, DEFAULT_USD_PER_CREDIT);
+    if (rate === undefined) {
+      console.warn(
+        "[pi-provider-kiro] Ignoring usageTracking.estimateDollarValue: usdPerCredit must be a finite number >= 0.",
+      );
+    } else {
+      usdPerCredit = rate;
+    }
+  }
+
+  let cacheEnabled = estimateCacheUsage;
+  if (estimateCacheUsage) {
+    const timeout = resolveNonNegativeNumber(section.estimatedCacheTimeout, DEFAULT_ESTIMATED_CACHE_TIMEOUT_MS);
+    if (timeout === undefined) {
+      console.warn(
+        "[pi-provider-kiro] Ignoring usageTracking.estimateCacheUsage: estimatedCacheTimeout must be a finite number >= 0.",
+      );
+      cacheEnabled = false;
+    } else {
+      estimatedCacheTimeout = timeout;
+    }
+  }
+
+  return {
+    estimateDollarValue:
+      estimateDollarValue && resolveNonNegativeNumber(section.usdPerCredit, DEFAULT_USD_PER_CREDIT) !== undefined,
+    usdPerCredit,
+    estimateCacheUsage: cacheEnabled,
+    estimatedCacheTimeout,
+  };
 }
 
 /**
@@ -54,7 +102,7 @@ export function estimateKiroCreditCost(
   tracking: KiroUsageTracking,
   metering: { credits?: number; unit?: string } | null | undefined,
 ): number | undefined {
-  if (!tracking.enabled || !metering) return undefined;
+  if (!tracking.estimateDollarValue || !metering) return undefined;
   if (typeof metering.unit !== "string" || !CREDIT_UNITS.has(metering.unit.toLowerCase())) return undefined;
   const { credits } = metering;
   if (typeof credits !== "number" || !Number.isFinite(credits) || credits < 0) return undefined;
@@ -71,7 +119,7 @@ function readSettings(path: string): unknown {
   try {
     contents = readFileSync(path, "utf-8");
   } catch {
-    return undefined; // No settings file is the common case, not an error.
+    return undefined;
   }
   try {
     return JSON.parse(contents);
@@ -81,9 +129,8 @@ function readSettings(path: string): unknown {
   }
 }
 
-/** An omitted rate takes the published default; a present one must be usable. */
-function resolveRate(value: unknown): number | undefined {
-  if (value === undefined) return DEFAULT_USD_PER_CREDIT;
+function resolveNonNegativeNumber(value: unknown, defaultValue: number): number | undefined {
+  if (value === undefined) return defaultValue;
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return undefined;
   return value;
 }
