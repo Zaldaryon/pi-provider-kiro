@@ -3074,6 +3074,30 @@ describe("Feature 9: Streaming Integration", () => {
   // First-token timeout (Task 1.2)
   // =========================================================================
 
+  it("clears the first-token timeout timer once the first token arrives (#154)", async () => {
+    vi.useFakeTimers();
+    const originalTimeout = retryConfig.firstTokenTimeoutMs;
+    // Long enough that the timer cannot fire mid-turn; the leak being tested
+    // is the *pending* handle surviving a completed happy-path request.
+    retryConfig.firstTokenTimeoutMs = 60_000;
+    const fetchMock = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":5}');
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "test" }));
+      expect(events.find((event) => event.type === "done")).toBeDefined();
+      // The losing timeout branch of the first-token race must not leave a
+      // ref'd timer pending: pre-fix, one firstTokenTimeout-class timer
+      // survived every completed turn and held the Node event loop open for
+      // up to 90 s in print mode (`pi -p`) and SDK embeds.
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      retryConfig.firstTokenTimeoutMs = originalTimeout;
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("retries when first token times out then succeeds on second attempt", async () => {
     const originalTimeout = retryConfig.firstTokenTimeoutMs;
     retryConfig.firstTokenTimeoutMs = 100;

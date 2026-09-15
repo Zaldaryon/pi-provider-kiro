@@ -1184,21 +1184,33 @@ function streamKiroWithUsageTracking(
           try {
             if (!gotFirstToken) {
               const readPromise = iterator.next();
-              const result = await Promise.race([
-                readPromise,
-                new Promise<typeof FIRST_TOKEN_SENTINEL>((resolve) =>
-                  setTimeout(() => resolve(FIRST_TOKEN_SENTINEL), firstTokenTimeoutForModel(model.id)),
-                ),
-              ]);
-              if (result === FIRST_TOKEN_SENTINEL) {
-                readPromise.catch(() => {}); // suppress dangling rejection
-                void bodyReader.cancel().catch(() => {});
-                firstTokenTimedOut = true;
-                break;
+              let firstTokenTimer: ReturnType<typeof setTimeout> | undefined;
+              try {
+                const result = await Promise.race([
+                  readPromise,
+                  new Promise<typeof FIRST_TOKEN_SENTINEL>((resolve) => {
+                    firstTokenTimer = setTimeout(
+                      () => resolve(FIRST_TOKEN_SENTINEL),
+                      firstTokenTimeoutForModel(model.id),
+                    );
+                  }),
+                ]);
+                if (result === FIRST_TOKEN_SENTINEL) {
+                  readPromise.catch(() => {}); // suppress dangling rejection
+                  void bodyReader.cancel().catch(() => {});
+                  firstTokenTimedOut = true;
+                  break;
+                }
+                iterResult = result as IteratorResult<Record<string, unknown>>;
+                gotFirstToken = true;
+                resetIdle();
+              } finally {
+                // The losing timeout branch of the race must not keep a ref'd
+                // timer alive until it fires: an uncleared 90 s handle holds
+                // the Node event loop open long after print-mode/SDK callers
+                // have finished their turn (#154).
+                if (firstTokenTimer !== undefined) clearTimeout(firstTokenTimer);
               }
-              iterResult = result as IteratorResult<Record<string, unknown>>;
-              gotFirstToken = true;
-              resetIdle();
             } else {
               iterResult = await iterator.next();
             }
