@@ -1484,6 +1484,39 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
+  it("reads tools and system prompts from pi 0.86 transcript contexts", async () => {
+    const context = {
+      messages: [
+        {
+          role: "system" as const,
+          content: "TRANSCRIPT_SYSTEM_MARKER",
+          toolsAdded: [
+            {
+              name: "grep",
+              description: "Search file contents",
+              parameters: { type: "object", properties: { pattern: { type: "string" } } },
+            },
+          ],
+          timestamp: ts,
+        },
+        { role: "user" as const, content: "Find the marker", timestamp: ts },
+      ],
+    };
+    const mockFetch = mockFetchOk('{"content":"Searching."}{"contextUsagePercentage":3}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const current = body.conversationState.currentMessage.userInputMessage;
+    const tools = current.userInputMessageContext?.tools as Array<{ toolSpecification: { name: string } }> | undefined;
+    expect(current.content).toContain("TRANSCRIPT_SYSTEM_MARKER");
+    expect(tools?.map((tool) => tool.toolSpecification.name)).toContain("grep");
+    expect(body.conversationState.history ?? []).toHaveLength(0);
+
+    vi.unstubAllGlobals();
+  });
+
   // =========================================================================
   // Placeholder tools when context.tools is empty/undefined (advisor path)
   // —————————————————————————————————————————————————————————————————————————
