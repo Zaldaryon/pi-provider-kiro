@@ -12,9 +12,11 @@ import type {
   Context,
   ImageContent,
   Model,
+  Message as PiMessage,
   SimpleStreamOptions,
   TextContent,
   ThinkingContent,
+  Tool,
   ToolCall,
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
@@ -390,9 +392,66 @@ function emitToolCall(
   return true;
 }
 
+interface TranscriptSystemMessage {
+  role: "system";
+  content: string | TextContent[];
+  sections?: Record<string, string | null>;
+  toolsAdded?: Tool[];
+  toolsRemoved?: Array<{ name: string }>;
+}
+
+type ProviderContext = Context | { messages: Array<PiMessage | TranscriptSystemMessage> };
+
+function transcriptContentText(content: string | TextContent[]): string {
+  if (typeof content === "string") return content;
+  return content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+}
+
+/**
+ * Resolve both legacy Context fields and pi 0.86+ transcript-backed prompt/tool state.
+ * Kiro carries the system prompt outside history, so system messages are collapsed
+ * and removed from the conversation passed to its user/assistant transformer.
+ */
+function resolveProviderContext(context: ProviderContext): {
+  messages: PiMessage[];
+  systemPrompt: string;
+  tools: Tool[];
+} {
+  const legacy = context as Context;
+  const promptParts = legacy.systemPrompt ? [legacy.systemPrompt] : [];
+  const sections = new Map<string, string>();
+  const tools = new Map((legacy.tools ?? []).map((tool) => [tool.name, tool]));
+  const messages: PiMessage[] = [];
+
+  for (const message of context.messages) {
+    if (message.role !== "system") {
+      messages.push(message as PiMessage);
+      continue;
+    }
+
+    const text = transcriptContentText(message.content);
+    if (text) promptParts.push(text);
+    for (const [name, value] of Object.entries(message.sections ?? {})) {
+      if (value === null) sections.delete(name);
+      else sections.set(name, value);
+    }
+    for (const tool of message.toolsRemoved ?? []) tools.delete(tool.name);
+    for (const tool of message.toolsAdded ?? []) tools.set(tool.name, tool);
+  }
+
+  return {
+    messages,
+    systemPrompt: [...promptParts, ...sections.values()].join("\n\n"),
+    tools: [...tools.values()],
+  };
+}
+
 export function streamKiro(
   model: Model<Api>,
-  context: Context,
+  context: ProviderContext,
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
   return streamKiroWithUsageTracking(
@@ -410,16 +469,22 @@ export function streamKiro(
 
 export function createKiroStream(
   usageTracking: KiroUsageTracking,
-): (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream {
+): (model: Model<Api>, context: ProviderContext, options?: SimpleStreamOptions) => AssistantMessageEventStream {
   return (model, context, options) => streamKiroWithUsageTracking(usageTracking, model, context, options);
 }
 
 function streamKiroWithUsageTracking(
   usageTracking: KiroUsageTracking,
   model: Model<Api>,
-  context: Context,
+  context: ProviderContext,
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
+  const {
+    messages: contextMessages,
+    tools: currentTools,
+    systemPrompt: currentSystemPrompt,
+  } = resolveProviderContext(context);
+
   // pi-ai's barrel re-exports the class as type-only before the runtime class re-export, so
   // a named import of AssistantMessageEventStream resolves to a type. Read it from the
   // namespace import to get the actual constructor. Replaces the removed
@@ -514,13 +579,13 @@ function streamKiroWithUsageTracking(
         contextWindow: model.contextWindow,
         thinkingEnabled,
         reasoning: options?.reasoning,
-        messageCount: context.messages.length,
-        toolCount: context.tools?.length ?? 0,
-        hasSystemPrompt: !!context.systemPrompt,
+        messageCount: contextMessages.length,
+        toolCount: currentTools.length,
+        hasSystemPrompt: !!currentSystemPrompt,
         profileArn,
         sessionId: options?.sessionId,
       });
-      let systemPrompt = context.systemPrompt ?? "";
+      let systemPrompt = currentSystemPrompt;
       // Kiro's runtime endpoint honors structured effort but only exposes Claude's
       // user-visible thinking stream when the legacy thinking markers are also
       // present. Keep both controls: structured fields select effort, while these
@@ -590,7 +655,7 @@ function streamKiroWithUsageTracking(
         // pairs POSITIONALLY, so without this pass the displaced result's issuing
         // assistant is dropped and the real tool output is discarded. Pure
         // reorder — see `relocateDisplacedToolResults`.
-        const normalized = relocateDisplacedToolResults(normalizeMessages(context.messages));
+        const normalized = relocateDisplacedToolResults(normalizeMessages(contextMessages));
         const {
           history: rawHistory,
           systemPrepended,
@@ -706,16 +771,16 @@ function streamKiroWithUsageTracking(
         // budget only after they have been appended.
         assertHistoryWithinLimit(history, dynamicHistoryLimit);
         // Prepend truncation notice if the previous assistant response was cut off
-        if (wasPreviousResponseTruncated(context.messages)) {
+        if (wasPreviousResponseTruncated(contextMessages)) {
           currentContent = currentContent === "" ? TRUNCATION_NOTICE : `${TRUNCATION_NOTICE}\n\n${currentContent}`;
         }
         // Always synthesize placeholder specs for tool names referenced in
-        // history, even when context.tools is empty/undefined. Without this,
+        // history, even when the current tools are empty/undefined. Without this,
         // an "advisor-style" call that inherits a tool-rich conversation but
         // declares no current tools is rejected by Kiro as "Improperly formed
         // request" because history references toolUses with no tool catalog.
         let uimc: { toolResults?: KiroToolResult[]; tools?: KiroToolSpec[] } | undefined;
-        const baseTools = context.tools?.length ? convertToolsToKiro(context.tools) : [];
+        const baseTools = currentTools.length ? convertToolsToKiro(currentTools) : [];
         const finalTools = history.length > 0 ? addPlaceholderTools(baseTools, history) : baseTools;
         if (currentToolResults.length > 0 || finalTools.length > 0) {
           uimc = {};
