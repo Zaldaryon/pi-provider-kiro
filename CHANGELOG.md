@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-22
+
+### Added
+
+- Opt-in Kiro usage footer indicator. Set `pi-provider-kiro.showUsageInFooter` to `true` to show a compact badge of the percent of Kiro allowance used (e.g. `◆ Kiro 1%`) while a Kiro model is active, colored by consumption (comfortable below 70%, warning at 70%, critical at 90%). It refreshes on session start, model switches, and after completed Kiro turns, throttled by a cooldown, and fails silently — hidden for non-Kiro models, when no credential resolves, or on any usage-lookup failure. Resolves the credential pi persists in `~/.pi/agent/auth.json` so the footer works even without a local kiro-cli/IDE credential, and exposes numeric `used`/`limit` on usage buckets so consumers can compute a percentage without parsing display strings. Disabled by default ([#165](https://github.com/mikeyobrien/pi-provider-kiro/pull/165)).
+
 ### Fixed
 
 - Clear the first-token timeout timer once the race is decided. The losing `setTimeout` of the first-token `Promise.race` was never cleared, so every completed request kept a ref'd 90 s timer pending that held the Node event loop open — `pi -p` and SDK embeds sat idle for up to 90 s after the answer printed ([#154](https://github.com/mikeyobrien/pi-provider-kiro/issues/154)).
@@ -270,7 +276,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial release: 17 models across 7 families, OAuth device code flow, kiro-cli SQLite credential fallback, streaming pipeline with thinking tag parser
 
-[Unreleased]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.10.0...v0.10.1
