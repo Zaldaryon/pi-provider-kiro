@@ -6,15 +6,22 @@ import type { Api, Model, OAuthCredentials, RefreshModelsContext } from "@earend
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { formatSafeError } from "./debug.js";
 import { getKiroEndpoints, resolveApiRegion } from "./endpoints.js";
-import { getKiroCliCredentials } from "./kiro-cli.js";
+import { loadKiroFooterConfig } from "./footer.js";
+import { registerKiroUsageFooter } from "./footer-lifecycle.js";
+import { getKiroCliCredentials, getKiroCliSocialToken } from "./kiro-cli.js";
+import { getKiroIdeCredentials } from "./kiro-ide.js";
 import { setExtensionContext } from "./login-ui.js";
 import { getCachedModels, isCacheStale, type KiroModel, kiroModels, updateKiroModelsCache } from "./models.js";
 import type { KiroCredentials } from "./oauth.js";
 import { loginKiro, refreshKiroToken } from "./oauth.js";
-import { streamKiro } from "./stream.js";
+import { getPiHostKiroCredentials } from "./pi-auth-store.js";
+import { createKiroStream } from "./stream.js";
 import { fetchKiroUsage } from "./usage.js";
+import { loadKiroUsageTracking } from "./usage-tracking.js";
 
 export { resolveApiRegion } from "./endpoints.js";
+export type { KiroProviderAttempts } from "./errors.js";
+export { KiroApiError } from "./errors.js";
 export type { KiroStreamEvent } from "./event-parser.js";
 export {
   isKiroToolStructureRule,
@@ -31,7 +38,22 @@ export {
   validateKiroConversation,
   validateKiroToolStructure,
 } from "./history-validator.js";
+export { KiroManagementHttpError } from "./management.js";
 export { KIRO_MODEL_IDS, kiroModels, resolveKiroModel } from "./models.js";
+// Kiro's own error vocabulary and the predicates this provider classifies it
+// with. Published so consumers can interpret a reason code without an error
+// instance in hand (e.g. a persisted log line) instead of hardcoding copies of
+// the literals, which drift when the service adds a code.
+export type { KiroReasonCode } from "./retry.js";
+export {
+  CAPACITY_PATTERN,
+  isCapacityError,
+  isNonRetryableBodyError,
+  isTooBigError,
+  KIRO_REASON_CODES,
+  NON_RETRYABLE_BODY_PATTERNS,
+  TOO_BIG_PATTERNS,
+} from "./retry.js";
 export { streamKiro } from "./stream.js";
 export {
   EMPTY_CONTENT_PLACEHOLDER,
@@ -41,22 +63,66 @@ export {
   type KiroUserInputMessage,
 } from "./transform.js";
 
+type KiroRefreshModelsContext = Omit<RefreshModelsContext, "credential" | "store"> & {
+  credential?: RefreshModelsContext["credential"] | KiroCredentials;
+  store?: RefreshModelsContext["store"];
+};
+
+type KiroRefreshCredential = KiroRefreshModelsContext["credential"];
+
 /**
- * Host-driven catalog refresh. `oauth.modifyModels` only projects whatever the
- * cache already holds, so this is the path that actually fetches when the host
- * asks for a refresh or the cache has gone stale. The composer re-applies
- * `modifyModels` on top of the returned list, so region/profileArn projection
- * still happens here.
- *
- * Persistence uses the existing Kiro management file cache
- * (`updateKiroModelsCache` / `~/.kiro-management-models-cache.json`) rather than
- * `context.store`, so oauth/stream and host refresh share one catalog source.
+ * Local credential discovery. Every source is a file or environment read, so this
+ * stays callable from the synchronous registration path.
  */
-async function refreshKiroModels(context: RefreshModelsContext): Promise<KiroModel[]> {
-  const credential = context.credential;
-  const oauthCredential = credential?.type === "oauth" ? (credential as unknown as KiroCredentials) : undefined;
-  const accessToken = oauthCredential?.access ?? (credential?.type === "api_key" ? credential.key : undefined);
-  const region = resolveApiRegion(oauthCredential?.region);
+function resolveLocalCredential(): KiroRefreshCredential {
+  const apiKey = process.env.KIRO_API_KEY;
+  if (apiKey) return { type: "api_key", key: apiKey };
+  try {
+    return getKiroCliSocialToken() ?? getKiroCliCredentials() ?? getKiroIdeCredentials() ?? undefined;
+  } catch (error) {
+    console.warn(`[pi-provider-kiro] Failed to read local Kiro credentials: ${formatSafeError(error)}`);
+    return undefined;
+  }
+}
+
+/**
+ * Resolve local credentials in OAuth form for footer usage lookups. Usage limits
+ * require an access token + region + profile ARN, so a bare API-key credential
+ * (which has no profile ARN to query) yields undefined and the footer stays hidden.
+ *
+ * Prefers pi's own persisted credential (~/.pi/agent/auth.json) since that is the
+ * one pi hands the provider at runtime; a kiro-cli/IDE credential may not exist.
+ */
+function resolveOAuthCredential(): OAuthCredentials | undefined {
+  const hostCredential = getPiHostKiroCredentials();
+  if (hostCredential) return hostCredential as OAuthCredentials;
+  const credential = resolveLocalCredential();
+  return credential && "access" in credential ? (credential as OAuthCredentials) : undefined;
+}
+
+function credentialRegion(credential: KiroRefreshCredential): string {
+  const oauthCredential = credential && "access" in credential ? (credential as KiroCredentials) : undefined;
+  return resolveApiRegion(oauthCredential?.region);
+}
+
+async function refreshCatalog(
+  credential: KiroRefreshCredential,
+  context: Pick<KiroRefreshModelsContext, "allowNetwork" | "force" | "signal">,
+): Promise<KiroModel[]> {
+  const oauthCredential = credential && "access" in credential ? (credential as KiroCredentials) : undefined;
+  const apiKey =
+    credential &&
+    "type" in credential &&
+    credential.type === "api_key" &&
+    "key" in credential &&
+    typeof credential.key === "string"
+      ? credential.key
+      : undefined;
+  const accessToken =
+    typeof oauthCredential?.access === "string" && oauthCredential.access ? oauthCredential.access : apiKey;
+  const region = credentialRegion(credential);
+
+  if (context.signal?.aborted) return [];
 
   if (accessToken && context.allowNetwork && (context.force || isCacheStale(region))) {
     try {
@@ -70,14 +136,60 @@ async function refreshKiroModels(context: RefreshModelsContext): Promise<KiroMod
   return getCachedModels(region);
 }
 
+/**
+ * Host-driven catalog refresh. `oauth.modifyModels` only projects whatever the
+ * cache already holds, so this is the path that actually fetches when the host
+ * asks for a refresh or the cache has gone stale. The composer re-applies
+ * `modifyModels` on top of the returned list, so region/profileArn projection
+ * still happens here.
+ *
+ * Persistence uses the existing Kiro management file cache
+ * (`updateKiroModelsCache` / `~/.kiro-management-models-cache.json`) rather than
+ * `context.store`, so oauth/stream and host refresh share one catalog source.
+ */
+function refreshKiroModels(context: KiroRefreshModelsContext): Promise<KiroModel[]> {
+  return refreshCatalog(context.credential ?? resolveLocalCredential(), context);
+}
+
+let startupCatalogRefresh: Promise<void> = Promise.resolve();
+
+/**
+ * The post-registration startup work the factory deliberately does not await.
+ * Exposed so tests can observe discovery without racing it.
+ */
+export function whenStartupCatalogSettled(): Promise<void> {
+  return startupCatalogRefresh;
+}
+
+/**
+ * Synchronous by contract. A host resolves `api: "kiro-api"` the moment a chat
+ * starts, and not every host awaits an async extension factory before then, so
+ * awaiting catalog discovery here left `kiro-api` unregistered while cached
+ * models were still offered in the picker — the first user message then crashed
+ * with `No API provider registered for api: kiro-api`. Discovery is kicked off
+ * afterwards and the host's `refreshModels` hook fills in the rest.
+ */
 export default function (pi: ExtensionAPI) {
   // Capture ctx for the custom TUI login component
   pi.on("session_start", async (_event, ctx) => {
     setExtensionContext(ctx);
   });
+
+  // Opt-in footer that shows Kiro allowance used. Kept behind a settings flag and
+  // wired through injectable seams so a usage hiccup can never disrupt a session.
+  registerKiroUsageFooter(pi, {
+    statusKey: "kiro-usage",
+    loadConfig: loadKiroFooterConfig,
+    resolveCredential: resolveOAuthCredential,
+    fetchUsage: fetchKiroUsage,
+  });
+
+  const credential = resolveLocalCredential();
+  const streamSimple = createKiroStream(loadKiroUsageTracking());
   pi.registerProvider("kiro", {
     baseUrl: getKiroEndpoints("us-east-1").runtime,
     api: "kiro-api",
+    apiKey: "$KIRO_API_KEY",
     models: kiroModels,
     refreshModels: refreshKiroModels,
     oauth: {
@@ -104,6 +216,12 @@ export default function (pi: ExtensionAPI) {
       fetchUsage: fetchKiroUsage,
       // biome-ignore lint/suspicious/noExplicitAny: ProviderConfig.oauth doesn't include getCliCredentials but OAuthProviderInterface does
     } as any,
-    streamSimple: streamKiro,
+    streamSimple,
   });
+
+  startupCatalogRefresh = refreshCatalog(credential, { allowNetwork: true })
+    .then(() => {})
+    .catch((error) => {
+      console.warn(`[pi-provider-kiro] Kiro startup catalog discovery failed: ${formatSafeError(error)}`);
+    });
 }

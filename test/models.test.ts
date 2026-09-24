@@ -1,6 +1,6 @@
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { getSupportedThinkingLevels, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { deriveKiroEffort } from "../src/effort.js";
@@ -13,7 +13,9 @@ import {
   KIRO_MANAGEMENT_CACHE_SOURCE,
   KIRO_MANAGEMENT_CACHE_VERSION,
   KIRO_MODEL_IDS,
+  type KiroModel,
   kiroModels,
+  LEGACY_HOME_CACHE_PATH,
   mapKiroCatalogModels,
   resolveApiRegion,
   resolveKiroModel,
@@ -53,6 +55,12 @@ const catalogFixture: KiroCatalogModel[] = [
     additionalModelRequestFieldsSchema: effortSchema("reasoning", ["none", "low", "medium", "high", "xhigh", "max"]),
   },
   {
+    modelId: "gpt-5.6-luna",
+    displayName: "GPT 5.6 Luna",
+    tokenLimits: { maxInputTokens: 300_000, maxOutputTokens: 128_000 },
+    additionalModelRequestFieldsSchema: effortSchema("reasoning", ["none", "low", "medium", "high", "xhigh", "max"]),
+  },
+  {
     modelId: "claude-opus-4.8",
     displayName: "Catalog Opus 4.8",
     tokenLimits: { maxInputTokens: 900_000, maxOutputTokens: 100_000 },
@@ -63,6 +71,7 @@ const catalogFixture: KiroCatalogModel[] = [
     additionalModelRequestFieldsSchema: effortSchema("output_config", ["low", "medium", "high", "max"]),
   },
   { modelId: "qwen3-coder-next" },
+  { modelId: "claude-fable-5.1" },
   {
     modelId: "claude-fable-5",
     tokenLimits: { maxInputTokens: 1_000_000, maxOutputTokens: 128_000 },
@@ -71,13 +80,16 @@ const catalogFixture: KiroCatalogModel[] = [
 ];
 
 beforeEach(() => {
+  mkdirSync(dirname(KIRO_MANAGEMENT_CACHE_PATH), { recursive: true });
   rmSync(KIRO_MANAGEMENT_CACHE_PATH, { force: true });
+  rmSync(LEGACY_HOME_CACHE_PATH, { force: true });
   rmSync(LEGACY_CACHE_PATH, { force: true });
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
   rmSync(KIRO_MANAGEMENT_CACHE_PATH, { force: true });
+  rmSync(LEGACY_HOME_CACHE_PATH, { force: true });
   rmSync(LEGACY_CACHE_PATH, { force: true });
 });
 
@@ -111,6 +123,7 @@ describe("Feature 2: Model Definitions", () => {
       ["eu-west-1", "eu-central-1"],
       ["ap-southeast-2", "us-east-1"],
       ["sa-east-1", "us-east-1"],
+      ["ap-northeast-2", "us-east-1"],
       ["us-east-1", "us-east-1"],
       [undefined, "us-east-1"],
     ])("maps %s to %s", (ssoRegion, apiRegion) => {
@@ -165,11 +178,24 @@ describe("Feature 2: Model Definitions", () => {
       expect(mapped.find((model) => model.id === expected.id)).toMatchObject(expected);
     });
 
+    it("advertises verified Luna vision without broadening other non-Claude models", () => {
+      expect(mapped.find((model) => model.id === "gpt-5-6-luna")?.input).toEqual(["text", "image"]);
+      expect(mapped.find((model) => model.id === "openai-gpt-5-6")?.input).toEqual(["text"]);
+      expect(mapped.find((model) => model.id === "qwen3-coder-next")?.input).toEqual(["text"]);
+    });
+
+    it("keeps version dots when generating a name for a model outside the bootstrap list", () => {
+      const fable = mapped.find((model) => model.id === "claude-fable-5-1");
+      expect(fable?.kiroModelId).toBe("claude-fable-5.1");
+      expect(fable?.name).toBe("Claude Fable 5.1");
+    });
+
     it("retains fresh schema and token metadata for a model also present in the bootstrap list", () => {
       const opus = mapped.find((model) => model.id === "claude-opus-4-8");
       expect(opus?.name).toBe("Catalog Opus 4.8");
-      expect(opus?.additionalModelRequestFieldsSchema).toEqual(catalogFixture[1].additionalModelRequestFieldsSchema);
-      expect(opus?.tokenLimits).toEqual(catalogFixture[1].tokenLimits);
+      const catalogOpus = catalogFixture.find((model) => model.modelId === "claude-opus-4.8");
+      expect(opus?.additionalModelRequestFieldsSchema).toEqual(catalogOpus?.additionalModelRequestFieldsSchema);
+      expect(opus?.tokenLimits).toEqual(catalogOpus?.tokenLimits);
       expect(opus?.contextWindow).not.toBe(kiroModels.find((model) => model.id === opus?.id)?.contextWindow);
     });
 
@@ -207,6 +233,12 @@ describe("Feature 2: Model Definitions", () => {
   });
 
   describe("management model cache", () => {
+    it("uses ~/.pi/agent as the primary version 2 cache location", () => {
+      expect(KIRO_MANAGEMENT_CACHE_PATH).toBe(join(homedir(), ".pi", "agent", "kiro-management-models-cache.json"));
+      expect(LEGACY_HOME_CACHE_PATH).toBe(join(homedir(), ".kiro-management-models-cache.json"));
+      expect(KIRO_MANAGEMENT_CACHE_VERSION).toBe(2);
+    });
+
     it("accepts the versioned cache and treats its regional catalog as authoritative", async () => {
       const fetchMock = vi.fn().mockResolvedValue({
         ok: true,
@@ -238,6 +270,62 @@ describe("Feature 2: Model Definitions", () => {
       expect(cachedModels.some((model) => model.id === "auto")).toBe(false);
       expect(resolveKiroModel("openai-gpt-5-6")).toBe("openai-gpt-5.6");
       expect(isCacheStale(TEST_REGION)).toBe(false);
+    });
+
+    it("repairs stale Luna image metadata in memory without rewriting the cache", () => {
+      const [cachedLuna] = mapKiroCatalogModels([{ modelId: "gpt-5.6-luna" }], TEST_REGION);
+      cachedLuna.input = ["text"];
+      const serialized = JSON.stringify({
+        version: KIRO_MANAGEMENT_CACHE_VERSION,
+        source: KIRO_MANAGEMENT_CACHE_SOURCE,
+        regions: {
+          [TEST_REGION]: {
+            region: TEST_REGION,
+            fetchedAt: Date.now(),
+            models: [cachedLuna],
+          },
+        },
+      });
+      writeFileSync(KIRO_MANAGEMENT_CACHE_PATH, serialized, "utf-8");
+
+      expect(getCachedModels(TEST_REGION)[0]?.input).toEqual(["text", "image"]);
+      expect(readFileSync(KIRO_MANAGEMENT_CACHE_PATH, "utf-8")).toBe(serialized);
+    });
+
+    it("reads the version 2 legacy home cache when the primary cache is absent", () => {
+      const legacyModels = mapKiroCatalogModels([{ modelId: "legacy-only" }], TEST_REGION);
+      writeFileSync(
+        LEGACY_HOME_CACHE_PATH,
+        JSON.stringify({
+          version: KIRO_MANAGEMENT_CACHE_VERSION,
+          source: KIRO_MANAGEMENT_CACHE_SOURCE,
+          regions: {
+            [TEST_REGION]: { region: TEST_REGION, fetchedAt: Date.now(), models: legacyModels },
+          },
+        }),
+        "utf-8",
+      );
+
+      expect(getCachedModels(TEST_REGION).map((model) => model.id)).toEqual(["legacy-only"]);
+      expect(resolveKiroModel("legacy-only")).toBe("legacy-only");
+      expect(isCacheStale(TEST_REGION)).toBe(false);
+    });
+
+    it("prefers the primary cache when both cache paths are valid", () => {
+      const legacyModels = mapKiroCatalogModels([{ modelId: "legacy-only" }], TEST_REGION);
+      const primaryModels = mapKiroCatalogModels([{ modelId: "primary-only" }], TEST_REGION);
+      const cacheWith = (models: KiroModel[]) =>
+        JSON.stringify({
+          version: KIRO_MANAGEMENT_CACHE_VERSION,
+          source: KIRO_MANAGEMENT_CACHE_SOURCE,
+          regions: {
+            [TEST_REGION]: { region: TEST_REGION, fetchedAt: Date.now(), models },
+          },
+        });
+      writeFileSync(LEGACY_HOME_CACHE_PATH, cacheWith(legacyModels), "utf-8");
+      writeFileSync(KIRO_MANAGEMENT_CACHE_PATH, cacheWith(primaryModels), "utf-8");
+
+      expect(getCachedModels(TEST_REGION).map((model) => model.id)).toEqual(["primary-only"]);
     });
 
     it("ignores both the old Q cache path and an unversioned cache at the management path", () => {
@@ -289,7 +377,7 @@ describe("Feature 2: Model Definitions", () => {
       expect(kiroModels.find((model) => model.id === "minimax-m2-1")?.reasoning).toBe(false);
     });
 
-    it("uses image input for Claude and text input for other concrete models", () => {
+    it("uses image input for Claude and text input for other concrete bootstrap models", () => {
       const claudeModels = kiroModels.filter((model) => model.id.startsWith("claude-"));
       const nonClaudeModels = kiroModels.filter((model) => !model.id.startsWith("claude-") && model.id !== "auto");
       expect(claudeModels.every((model) => model.input.includes("text") && model.input.includes("image"))).toBe(true);
